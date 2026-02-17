@@ -7,66 +7,36 @@ Run with:
 """
 
 import os
-from typing import Optional
+from typing import Optional, Dict, List
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from systemprompt import SYSTEM_PROMPT
+
+# ==============================
+# Load Environment Variables
+# ==============================
 load_dotenv()
 
-
-# ==============================
-# Configuration
-# ==============================
-
-# Load Groq API key
-GROQ_API_KEY=os.getenv("GROQ_API_KEY")
-
-# Groq OpenAI-compatible endpoint
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
-
-# Fast + free model options:
 MODEL_NAME = "llama-3.1-8b-instant"
-
-SYSTEM_PROMPT = """
-You are AgriVision360 AI, an intelligent agricultural assistant designed to support farmers, agribusiness owners, and agricultural students.
-
-Your role is to provide accurate, practical, and easy-to-understand guidance related to:
-
-- Crop selection and seasonal planning
-- Soil health and fertilizer recommendations
-- Weather-based farming advice
-- Pest and disease identification and prevention
-- Irrigation methods and water management
-- Government agricultural schemes and subsidies (India-focused unless specified otherwise)
-- Market prices and crop selling strategies
-- Sustainable and modern farming techniques
-- Agri-technology and smart farming solutions
-
-Guidelines:
-- Always provide clear, actionable, step-by-step advice when applicable.
-- Keep explanations simple and avoid unnecessary technical jargon unless requested.
-- When location is relevant, ask for the user’s region before giving specific recommendations.
-- Prioritize farmer safety, sustainability, and cost-effective solutions.
-- If uncertain, clearly state limitations instead of guessing.
-- Never provide harmful, illegal, or unsafe agricultural instructions.
-- Maintain a supportive, professional, and solution-focused tone.
-
-Your goal is to help farmers make informed decisions, increase productivity, reduce risks, and adopt smart agricultural practices.
-
-
-"""
-
 REQUEST_TIMEOUT = 20.0
+
+# ==============================
+# System Prompt
+# ==============================
 
 
 # ==============================
 # FastAPI Initialization
 # ==============================
 
-app = FastAPI(title="Groq Chatbot Proxy API")
+app = FastAPI(title="AgriVision360 Groq Chatbot API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,6 +46,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ==============================
+# In-Memory Conversation Storage
+# ==============================
+
+conversation_memory: Dict[str, List[dict]] = {}
+MAX_HISTORY = 8  # number of past messages to keep (excluding system prompt)
 
 # ==============================
 # Pydantic Models
@@ -83,10 +59,12 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1)
+    session_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     response: str
+    session_id: str
 
 
 # ==============================
@@ -110,13 +88,31 @@ async def chat(request: ChatRequest):
             detail="Message cannot be empty."
         )
 
+    # Create new session if not provided
+    session_id = request.session_id or str(uuid4())
+
+    # Initialize conversation memory
+    if session_id not in conversation_memory:
+        conversation_memory[session_id] = [
+            {"role": "system", "content": SYSTEM_PROMPT}
+        ]
+
+    # Add user message
+    conversation_memory[session_id].append(
+        {"role": "user", "content": user_message}
+    )
+
+    # Trim conversation history
+    if len(conversation_memory[session_id]) > MAX_HISTORY + 1:
+        conversation_memory[session_id] = (
+            [conversation_memory[session_id][0]] +
+            conversation_memory[session_id][-MAX_HISTORY:]
+        )
+
     payload = {
         "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message}
-        ],
-        "temperature": 0.7,
+        "messages": conversation_memory[session_id],
+        "temperature": 0.6,
         "max_tokens": 500
     }
 
@@ -148,7 +144,15 @@ async def chat(request: ChatRequest):
                 detail="Invalid response format from Groq API."
             )
 
-        return ChatResponse(response=ai_reply)
+        # Save assistant reply to memory
+        conversation_memory[session_id].append(
+            {"role": "assistant", "content": ai_reply}
+        )
+
+        return ChatResponse(
+            response=ai_reply,
+            session_id=session_id
+        )
 
     except httpx.TimeoutException:
         raise HTTPException(
