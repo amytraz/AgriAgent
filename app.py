@@ -20,17 +20,13 @@ from systemprompt import SYSTEM_PROMPT
 # ==============================
 # Load Environment Variables
 # ==============================
+
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 MODEL_NAME = "llama-3.1-8b-instant"
 REQUEST_TIMEOUT = 20.0
-
-# ==============================
-# System Prompt
-# ==============================
-
 
 # ==============================
 # FastAPI Initialization
@@ -51,7 +47,9 @@ app.add_middleware(
 # ==============================
 
 conversation_memory: Dict[str, List[dict]] = {}
-MAX_HISTORY = 8  # number of past messages to keep (excluding system prompt)
+MAX_HISTORY = 6  # Keep recent messages
+SUMMARY_TRIGGER = 12  # When to summarize
+
 
 # ==============================
 # Pydantic Models
@@ -65,6 +63,43 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     session_id: str
+
+
+# ==============================
+# Helper: Summarize Conversation
+# ==============================
+
+async def summarize_history(messages: List[dict]) -> str:
+    """
+    Summarizes older chat history to maintain context without token overload.
+    """
+    summary_prompt = [
+        {"role": "system", "content": "Summarize this farming conversation briefly for context retention."},
+        {"role": "user", "content": str(messages)}
+    ]
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": summary_prompt,
+        "temperature": 0.3,
+        "max_tokens": 120
+    }
+
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.post(GROQ_API_URL, json=payload, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+
+    return (
+        data.get("choices", [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
 
 
 # ==============================
@@ -88,32 +123,46 @@ async def chat(request: ChatRequest):
             detail="Message cannot be empty."
         )
 
-    # Create new session if not provided
+    # Create or use existing session
     session_id = request.session_id or str(uuid4())
 
-    # Initialize conversation memory
+    # Initialize memory
     if session_id not in conversation_memory:
         conversation_memory[session_id] = [
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
 
-    # Add user message
-    conversation_memory[session_id].append(
-        {"role": "user", "content": user_message}
-    )
+    memory = conversation_memory[session_id]
 
-    # Trim conversation history
-    if len(conversation_memory[session_id]) > MAX_HISTORY + 1:
-        conversation_memory[session_id] = (
-            [conversation_memory[session_id][0]] +
-            conversation_memory[session_id][-MAX_HISTORY:]
-        )
+    # Add user message
+    memory.append({"role": "user", "content": user_message})
+
+    # ==============================
+    # Smart Memory Management
+    # ==============================
+
+    # If conversation grows too large, summarize older messages
+    if len(memory) > SUMMARY_TRIGGER:
+        old_messages = memory[1:-MAX_HISTORY]  # exclude system + latest messages
+        summary = await summarize_history(old_messages)
+
+        # Replace old messages with summary
+        memory = [
+            memory[0],  # system prompt
+            {"role": "system", "content": f"Conversation summary: {summary}"}
+        ] + memory[-MAX_HISTORY:]
+
+        conversation_memory[session_id] = memory
+
+    # ==============================
+    # Prepare Request to Groq
+    # ==============================
 
     payload = {
         "model": MODEL_NAME,
-        "messages": conversation_memory[session_id],
+        "messages": memory,
         "temperature": 0.6,
-        "max_tokens": 500
+        "max_tokens": 220  # shorter controlled responses
     }
 
     headers = {
@@ -144,7 +193,7 @@ async def chat(request: ChatRequest):
                 detail="Invalid response format from Groq API."
             )
 
-        # Save assistant reply to memory
+        # Save assistant reply
         conversation_memory[session_id].append(
             {"role": "assistant", "content": ai_reply}
         )
