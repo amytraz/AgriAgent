@@ -82,7 +82,7 @@ async def summarize_history(messages: List[dict]) -> str:
         "model": MODEL_NAME,
         "messages": summary_prompt,
         "temperature": 0.3,
-        "max_tokens": 120
+        "max_tokens": 220
     }
 
     headers = {
